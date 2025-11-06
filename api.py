@@ -6,8 +6,10 @@ import torch
 from werkzeug.utils import secure_filename
 from kernel_utils import VideoReader, FaceExtractor, confident_strategy, predict_on_video_set
 from training.zoo.classifiers import DeepFakeClassifier
+from flask_cors import CORS
 
 app = Flask(__name__)
+CORS(app, resources={r"/*": {"origins": "*"}}, supports_credentials=False)
 app.config['MAX_CONTENT_LENGTH'] = 100 * 1024 * 1024  # 100MB max file size
 app.config['UPLOAD_FOLDER'] = tempfile.gettempdir()
 
