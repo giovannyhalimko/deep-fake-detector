@@ -137,7 +137,7 @@ def predict():
 
         # Format results
         for filename, prediction in zip(video_filenames, predictions):
-            label = 'FAKE' if prediction > 0.5 else 'REAL'
+            label = 'FAKE' if prediction > 0.6 else 'REAL'
             
             # Save to history
             save_prediction(filename, float(prediction), label)
@@ -288,14 +288,14 @@ def predict_images():
                             'bbox': face['bbox'],
                             'face_confidence': face['confidence'],
                             'prediction': float(avg_pred),
-                            'label': 'FAKE' if avg_pred > 0.5 else 'REAL',
+                            'label': 'FAKE' if avg_pred > 0.6 else 'REAL',
                             'heatmap': heatmap_b64
                         })
                 
                 # Determine overall image prediction (if any face is fake, image is fake)
                 if faces_predictions:
                     max_pred = max(fp['prediction'] for fp in faces_predictions)
-                    overall_label = 'FAKE' if max_pred > 0.5 else 'REAL'
+                    overall_label = 'FAKE' if max_pred > 0.6 else 'REAL'
                     
                     # Save to history
                     save_prediction(filename, float(max_pred), overall_label)

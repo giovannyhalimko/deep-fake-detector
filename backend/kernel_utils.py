@@ -6,9 +6,15 @@ import cv2
 import numpy as np
 import torch
 from PIL import Image
-from albumentations.augmentations.functional import image_compression
 from facenet_pytorch.models.mtcnn import MTCNN
 from concurrent.futures import ThreadPoolExecutor
+
+# Local implementation of image compression to replace deprecated albumentations functional
+def image_compression(img, quality, image_type=".jpg"):
+    encode_param = [int(cv2.IMWRITE_JPEG_QUALITY), quality]
+    _, encimg = cv2.imencode(image_type, img, encode_param)
+    decimg = cv2.imdecode(encimg, 1)
+    return decimg
 
 from torchvision.transforms import Normalize
 
@@ -341,7 +347,7 @@ def confident_strategy(pred, t=0.8):
     sz = len(pred)
     fakes = np.count_nonzero(pred > t)
     # 11 frames are detected as fakes with high probability
-    if fakes > sz // 2.5 and fakes > 11:
+    if fakes > sz // 2.5 and (fakes > 11 or sz < 20):
         return np.mean(pred[pred > t])
     elif np.count_nonzero(pred < 0.2) > 0.9 * sz:
         return np.mean(pred[pred < 0.2])
@@ -517,15 +523,26 @@ def predict_on_image(face_crop, input_size, models, strategy=np.mean, with_heatm
         face_resized = isotropically_resize_image(face_crop, input_size)
         face_centered = put_to_center(face_resized, input_size)
         
-        # Convert to tensor
-        face_tensor = torch.tensor(face_centered).float().permute(2, 0, 1) / 255.0
-        face_tensor = normalize_transform(face_tensor)
+        # Create TTA versions (Original + Horizontal Flip)
+        face_centered_flip = cv2.flip(face_centered, 1)
+        
+        # Convert to tensor list
+        images = [face_centered, face_centered_flip]
+        
+        # Prepare batch tensor
+        faces_tensor = []
+        for img in images:
+            tensor = torch.tensor(img).float().permute(2, 0, 1) / 255.0
+            tensor = normalize_transform(tensor)
+            faces_tensor.append(tensor)
+            
+        faces_tensor = torch.stack(faces_tensor)
         
         # Prepare input tensor
         if DEVICE == "cuda":
-            face_tensor = face_tensor.unsqueeze(0).to(DEVICE).half()
+            faces_tensor = faces_tensor.to(DEVICE).half()
         else:
-            face_tensor = face_tensor.unsqueeze(0).to(DEVICE).float()
+            faces_tensor = faces_tensor.to(DEVICE).float()
         
         # Get predictions from all models
         preds = []
@@ -536,13 +553,12 @@ def predict_on_image(face_crop, input_size, models, strategy=np.mean, with_heatm
         
         with context:
             for i, model in enumerate(models):
-                if with_heatmap and i == 0: # Generate heatmap only from the first model
-                     # Make sure model requires grad for heatmap
-                     # We might need to temporarily set mode to train or allow gradients? 
-                     # Actually eval mode is fine for grad-cam usually if params require grad
-                     # But loaded models might have requires_grad=False
+                if with_heatmap and i == 0: # Generate heatmap only from the first model and FIRST image (original)
+                     # We specifically want the heatmap for the ORIGINAL image
+                     # so we pass just the first item of the batch
+                     single_face_tensor = faces_tensor[0].unsqueeze(0)
                      
-                     CAM, pred_val = generate_gradcam(model, face_tensor)
+                     CAM, pred_val = generate_gradcam(model, single_face_tensor)
                      if CAM is not None:
                          # Merge heatmap with original image
                          heatmap_img = cv2.applyColorMap(np.uint8(255 * CAM), cv2.COLORMAP_JET)
@@ -563,15 +579,26 @@ def predict_on_image(face_crop, input_size, models, strategy=np.mean, with_heatm
                          buff = io.BytesIO()
                          pil_img.save(buff, format="JPEG")
                          heatmap = base64.b64encode(buff.getvalue()).decode("utf-8")
-                         
-                     preds.append(pred_val)
+                    
+                     # For the prediction value of this model, we should still use TTA if possible
+                     # But generate_gradcam returns prediction for the single image.
+                     # Let's just run the full batch through the model again for the TTA prediction
+                     with torch.no_grad():
+                        y_pred = model(faces_tensor)
+                        y_pred = torch.sigmoid(y_pred.squeeze())
+                        # Average/Strategy over the batch (2 images)
+                        pred_tta = y_pred.cpu().numpy().flatten().mean()
+                        preds.append(pred_tta)
+
                 else:
                     with torch.no_grad():
-                        y_pred = model(face_tensor)
-                        y_pred = torch.sigmoid(y_pred.squeeze())
-                        preds.append(y_pred.cpu().numpy().item())
+                        y_pred = model(faces_tensor)
+                        y_pred = torch.sigmoid(y_pred.squeeze()) # Shape: [2]
+                        # TTA averaging for this model
+                        pred_tta = y_pred.cpu().numpy().flatten().mean()
+                        preds.append(pred_tta)
         
-        # Aggregate predictions
+        # Aggregate predictions across models
         result = strategy(preds)
         
         if with_heatmap:
