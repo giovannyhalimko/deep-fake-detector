@@ -1,4 +1,6 @@
 import os
+import io
+import base64
 
 import cv2
 import numpy as np
@@ -15,6 +17,19 @@ np.int = int  # temporary patch for deprecated alias
 mean = [0.485, 0.456, 0.406]
 std = [0.229, 0.224, 0.225]
 normalize_transform = Normalize(mean, std)
+
+def get_device():
+    """Helper to get the most appropriate available device."""
+    if torch.cuda.is_available():
+        return "cuda"
+    elif torch.backends.mps.is_available():
+        return "mps"
+    else:
+        return "cpu"
+
+# Global device variable
+DEVICE = get_device()
+
 
 
 class VideoReader:
@@ -201,7 +216,10 @@ class VideoReader:
 class FaceExtractor:
     def __init__(self, video_read_fn):
         self.video_read_fn = video_read_fn
-        self.detector = MTCNN(margin=0, thresholds=[0.7, 0.8, 0.8], device="cuda")
+        # Use CPU for MTCNN on Mac to avoid some MPS specific ops issues, or try MPS if stable
+        # Using device=DEVICE might fail if MPS doesn't support some MTCNN ops, fallback to cpu for safety if MPS
+        mtcnn_device = "cuda" if torch.cuda.is_available() else "cpu" 
+        self.detector = MTCNN(margin=0, thresholds=[0.7, 0.8, 0.8], device=mtcnn_device)
 
     def process_videos(self, input_dir, filenames, video_idxs):
         videos_read = []
@@ -260,6 +278,61 @@ class FaceExtractor:
         input_dir = os.path.dirname(video_path)
         filenames = [os.path.basename(video_path)]
         return self.process_videos(input_dir, filenames, [0])
+
+
+def detect_faces_in_image(img_rgb, detector, padding_ratio=0.33):
+    """
+    Detect and extract faces from an image.
+    
+    Arguments:
+        img_rgb: numpy array of the image in RGB format (H x W x 3)
+        detector: MTCNN detector instance
+        padding_ratio: padding around face as ratio of face size (default: 0.33 = 33%)
+    
+    Returns:
+        list of dicts, each containing:
+            - bbox: dict with xmin, ymin, xmax, ymax
+            - confidence: detection confidence score
+            - face_crop: numpy array of the cropped face (RGB)
+    """
+    img_pil = Image.fromarray(img_rgb.astype(np.uint8))
+    
+    # Detect faces
+    boxes, probs = detector.detect(img_pil, landmarks=False)
+    
+    faces = []
+    if boxes is not None:
+        for i, (box, prob) in enumerate(zip(boxes, probs)):
+            if box is not None:
+                xmin, ymin, xmax, ymax = [int(b) for b in box]
+                
+                # Add padding to face crop
+                w = xmax - xmin
+                h = ymax - ymin
+                p_h = int(h * padding_ratio)
+                p_w = int(w * padding_ratio)
+                
+                # Crop face with padding (clamped to image bounds)
+                crop_ymin = max(ymin - p_h, 0)
+                crop_ymax = min(ymax + p_h, img_rgb.shape[0])
+                crop_xmin = max(xmin - p_w, 0)
+                crop_xmax = min(xmax + p_w, img_rgb.shape[1])
+                
+                face_crop = img_rgb[crop_ymin:crop_ymax, crop_xmin:crop_xmax]
+                
+                faces.append({
+                    'face_index': i,
+                    'bbox': {
+                        'xmin': xmin,
+                        'ymin': ymin,
+                        'xmax': xmax,
+                        'ymax': ymax
+                    },
+                    'confidence': float(prob),
+                    'face_crop': face_crop
+                })
+    
+    return faces
 
 
 
@@ -324,7 +397,7 @@ def predict_on_video(face_extractor, video_path, batch_size, input_size, models,
                     else:
                         pass
             if n > 0:
-                x = torch.tensor(x, device="cuda").float()
+                x = torch.tensor(x, device=DEVICE).float()
                 # Preprocess the images.
                 x = x.permute((0, 3, 1, 2))
                 for i in range(len(x)):
@@ -333,7 +406,9 @@ def predict_on_video(face_extractor, video_path, batch_size, input_size, models,
                 with torch.no_grad():
                     preds = []
                     for model in models:
-                        y_pred = model(x[:n].half())
+                        # Handle mixed precision (half) only if CUDA is available, otherwise float32
+                        input_tensor = x[:n].half() if DEVICE == "cuda" else x[:n].float()
+                        y_pred = model(input_tensor)
                         y_pred = torch.sigmoid(y_pred.squeeze())
                         bpred = y_pred[:n].cpu().numpy()
                         preds.append(strategy(bpred))
@@ -359,3 +434,152 @@ def predict_on_video_set(face_extractor, videos, input_size, num_workers, test_d
         predictions = ex.map(process_file, range(len(videos)))
     return list(predictions)
 
+
+def generate_gradcam(model, input_tensor, target_layer=None):
+    """
+    Generate Grad-CAM heatmap for a specific input and model.
+    """
+    if target_layer is None:
+        # Default to the last convolutional layer of the encoder (EfficientNet)
+        # Structure depends on timm/efficientnet implementation
+        # Usually model.encoder.conv_head or model.encoder.blocks[-1]
+        try:
+            target_layer = model.encoder.conv_head
+        except:
+            return None
+
+    gradients = []
+    activations = []
+
+    def save_gradient(grad):
+        gradients.append(grad)
+
+    def save_activation(module, input, output):
+        activations.append(output)
+
+    # Register hooks
+    handle_grad = target_layer.register_backward_hook(lambda m, i, o: save_gradient(o[0]))
+    handle_act = target_layer.register_forward_hook(save_activation)
+
+    # Forward pass
+    model.zero_grad()
+    output = model(input_tensor)
+    output = torch.sigmoid(output)
+    
+    # Backward pass with respect to the output class (fake)
+    output.backward()
+
+    # Generate heatmap
+    if gradients and activations:
+        grad = gradients[0].cpu().data.numpy()[0]
+        act = activations[0].cpu().data.numpy()[0]
+        
+        weights = np.mean(grad, axis=(1, 2))
+        cam = np.zeros(act.shape[1:], dtype=np.float32)
+
+        for i, w in enumerate(weights):
+            cam += w * act[i]
+
+        cam = np.maximum(cam, 0)
+        cam = cv2.resize(cam, (input_tensor.shape[2], input_tensor.shape[3]))
+        cam = cam - np.min(cam)
+        cam = cam / (np.max(cam) + 1e-8)  # Normalize
+        
+        # Cleanup hooks
+        handle_grad.remove()
+        handle_act.remove()
+        
+        return cam, output.item()
+    
+    handle_grad.remove()
+    handle_act.remove()
+    return None, output.item()
+
+
+def predict_on_image(face_crop, input_size, models, strategy=np.mean, with_heatmap=False):
+    """
+    Predict deepfake probability on a single face crop.
+    
+    Arguments:
+        face_crop: numpy array of the face image (RGB format, H x W x 3)
+        input_size: target size for model input (e.g., 380)
+        models: list of loaded DeepFakeClassifier models
+        strategy: aggregation strategy for model predictions (default: np.mean)
+        with_heatmap: boolean, if True returns (prediction, heatmap_base64)
+    
+    Returns:
+        float: prediction score (0 = real, 1 = fake)
+        OR
+        (float, str): prediction score and base64 heatmap (if with_heatmap=True)
+    """
+    try:
+        # Preprocess face for model
+        face_resized = isotropically_resize_image(face_crop, input_size)
+        face_centered = put_to_center(face_resized, input_size)
+        
+        # Convert to tensor
+        face_tensor = torch.tensor(face_centered).float().permute(2, 0, 1) / 255.0
+        face_tensor = normalize_transform(face_tensor)
+        
+        # Prepare input tensor
+        if DEVICE == "cuda":
+            face_tensor = face_tensor.unsqueeze(0).to(DEVICE).half()
+        else:
+            face_tensor = face_tensor.unsqueeze(0).to(DEVICE).float()
+        
+        # Get predictions from all models
+        preds = []
+        heatmap = None
+        
+        # For prediction, we use no_grad unless we need heatmap
+        context = torch.enable_grad() if with_heatmap else torch.no_grad()
+        
+        with context:
+            for i, model in enumerate(models):
+                if with_heatmap and i == 0: # Generate heatmap only from the first model
+                     # Make sure model requires grad for heatmap
+                     # We might need to temporarily set mode to train or allow gradients? 
+                     # Actually eval mode is fine for grad-cam usually if params require grad
+                     # But loaded models might have requires_grad=False
+                     
+                     CAM, pred_val = generate_gradcam(model, face_tensor)
+                     if CAM is not None:
+                         # Merge heatmap with original image
+                         heatmap_img = cv2.applyColorMap(np.uint8(255 * CAM), cv2.COLORMAP_JET)
+                         heatmap_img = np.float32(heatmap_img) / 255
+                         
+                         # Resize original face to input size for overlay
+                         overlay_img = cv2.cvtColor(face_centered, cv2.COLOR_RGB2BGR)
+                         overlay_img = np.float32(overlay_img) / 255
+                         
+                         # Blend
+                         cam_result = heatmap_img + overlay_img
+                         cam_result = cam_result / np.max(cam_result)
+                         cam_result = np.uint8(255 * cam_result)
+                         cam_result = cv2.cvtColor(cam_result, cv2.COLOR_BGR2RGB)
+                         
+                         # Encode to base64
+                         pil_img = Image.fromarray(cam_result)
+                         buff = io.BytesIO()
+                         pil_img.save(buff, format="JPEG")
+                         heatmap = base64.b64encode(buff.getvalue()).decode("utf-8")
+                         
+                     preds.append(pred_val)
+                else:
+                    with torch.no_grad():
+                        y_pred = model(face_tensor)
+                        y_pred = torch.sigmoid(y_pred.squeeze())
+                        preds.append(y_pred.cpu().numpy().item())
+        
+        # Aggregate predictions
+        result = strategy(preds)
+        
+        if with_heatmap:
+            return result, heatmap
+        return result
+        
+    except Exception as e:
+        print(f"Prediction error on image: {str(e)}")
+        if with_heatmap:
+            return 0.5, None
+        return 0.5

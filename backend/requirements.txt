@@ -1,0 +1,21 @@
+# Core Framework
+flask
+flask-cors
+
+# Machine Learning & Computer Vision
+torch
+torchvision
+opencv-python
+pillow
+numpy
+pandas
+
+# Deep Learning specific
+facenet-pytorch
+albumentations==1.0.0
+timm==0.4.12
+pytorch_toolbelt
+
+# Utilities
+tqdm
+werkzeug
