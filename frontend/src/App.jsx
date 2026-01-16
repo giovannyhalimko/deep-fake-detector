@@ -54,7 +54,7 @@ function App() {
 
       formData.append(fieldName, selectedFile);
 
-      const response = await fetch(`${process.env.VITE_API_URL}${endpoint}`, {
+      const response = await fetch(`${import.meta.env.VITE_API_URL}${endpoint}`, {
         method: "POST",
         body: formData,
       });
