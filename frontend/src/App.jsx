@@ -1,5 +1,4 @@
 import { useState } from "react";
-import API_URL from "./config";
 import { simulateProgress } from "./utils";
 import Header from "./components/Header";
 import TabBar from "./components/TabBar";
@@ -55,7 +54,7 @@ function App() {
 
       formData.append(fieldName, selectedFile);
 
-      const response = await fetch(`${API_URL}${endpoint}`, {
+      const response = await fetch(`${process.env.API_URL}${endpoint}`, {
         method: "POST",
         body: formData,
       });
